@@ -1,5 +1,8 @@
 # Auto-scalanie (decyzja Kamila, 21.10.2026): PR do main scala się sam, gdy wszystkie testy są zielone.
-# Wspólny plik w 5 repozytoriach projektu — różnią się tylko CI_WORKFLOWS, BEZ_CI, WSTRZYMAJ_SCIEZKI i PO_SCALENIU.
+# Wspólny plik w 5 repozytoriach projektu — różnią się tylko CI_WORKFLOWS (i on.workflow_run.workflows), BEZ_CI,
+# WSTRZYMAJ_SCIEZKI, PO_SCALENIU i typy zdarzeń pull_request (repozytorium z testami: tylko ready_for_review/unlabeled).
+# Oszczędność minut Actions (21.10.2026): przebieg po testach, które nie przeszły albo nie były z PR, jest pomijany
+# (zadanie pominięte nie zużywa minut), a każdy przebieg sprawdza wszystkie otwarte PR (zgubione zdarzenie nie szkodzi).
 # Nie scala: szkiców (draft), PR z etykietą „wstrzymane” albo „decyzja-kamila”, PR z forków, PR z konfliktem,
 # PR zmieniających ścieżki z WSTRZYMAJ_SCIEZKI (np. migracje bazy — te scala wątek po wdrożeniu bazy).
 # Scalenie tokenem GITHUB_TOKEN nie uruchamia workflowów „push” na main, dlatego po scaleniu ten plik sam uruchamia
@@ -24,6 +27,7 @@ concurrency:
 
 jobs:
   scalanie:
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -34,7 +38,8 @@ jobs:
           BEZ_CI: 'tak'
           # PR zmieniający te ścieżki czeka na wątek (np. migracje: najpierw baza, potem aplikacja)
           WSTRZYMAJ_SCIEZKI: '[]'
-          # po scaleniu: [{"plik": "x.yml", "sciezki": ["prefiks/"]}] — puste sciezki = zawsze
+          # po scaleniu: [{"plik": "x.yml", "sciezki": ["prefiks/", "*.cs"]}] — puste sciezki = zawsze; same testy nie wracają
+          # tu (PR przeszedł je na tym samym kodzie) — tylko przebiegi, które coś budują albo wydają
           PO_SCALENIU: '[]'
         with:
           script: |
@@ -45,15 +50,16 @@ jobs:
             const poScaleniu = JSON.parse(process.env.PO_SCALENIU);
             const ETYKIETY_STOP = ['wstrzymane', 'decyzja-kamila'];
             const sen = ms => new Promise(r => setTimeout(r, ms));
+            // ścieżka: prefiks („CommandCenter/app/”) albo koniec nazwy („*.cs”)
+            const pasuje = (f, s) => s.startsWith('*') ? f.endsWith(s.slice(1)) : f.startsWith(s);
 
             // PR do sprawdzenia: z tego zdarzenia albo wszystkie otwarte do main
             let numery = [];
             if (context.eventName === 'pull_request') numery = [context.payload.pull_request.number];
             else if (context.eventName === 'workflow_run') numery = (context.payload.workflow_run.pull_requests || []).map(p => p.number);
-            if (!numery.length) {
-              const otwarte = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', base: 'main', per_page: 100 });
-              numery = otwarte.map(p => p.number);
-            }
+            // potem pozostałe otwarte PR: przy kolejce (concurrency) GitHub zastępuje oczekujący przebieg nowszym
+            const otwarte = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', base: 'main', per_page: 100 });
+            numery = [...new Set([...numery, ...otwarte.map(p => p.number)])];
 
             for (const nr of numery) {
               let pr = (await github.rest.pulls.get({ owner, repo, pull_number: nr })).data;
@@ -66,7 +72,7 @@ jobs:
               if (stop.length) { pomin(`etykieta ${stop.join(', ')}`); continue; }
 
               const pliki = (await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: nr, per_page: 100 })).map(f => f.filename);
-              const zablokowane = pliki.filter(f => wstrzymaj.some(p => f.startsWith(p)));
+              const zablokowane = pliki.filter(f => wstrzymaj.some(p => pasuje(f, p)));
               if (zablokowane.length) { pomin(`zmienia ${zablokowane[0]} (scala wątek po wdrożeniu)`); continue; }
 
               // testy na ostatnim commicie PR
@@ -96,7 +102,7 @@ jobs:
               await github.rest.issues.createComment({ owner, repo, issue_number: nr,
                 body: 'Scalone automatycznie: wszystkie testy zielone (Auto-scalanie, decyzja Kamila 21.10.2026). Etykieta „wstrzymane” albo „decyzja-kamila” zatrzymuje scalanie.' });
               for (const p of poScaleniu) {
-                if (p.sciezki.length && !pliki.some(f => p.sciezki.some(s => f.startsWith(s)))) continue;
+                if (p.sciezki.length && !pliki.some(f => p.sciezki.some(s => pasuje(f, s)))) continue;
                 try { await github.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: p.plik, ref: 'main' }); core.info(`uruchomiono ${p.plik} na main`); }
                 catch (e) { core.warning(`${p.plik}: ${e.message}`); }
               }
