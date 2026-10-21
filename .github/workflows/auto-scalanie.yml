@@ -1,0 +1,103 @@
+# Auto-scalanie (decyzja Kamila, 21.10.2026): PR do main scala się sam, gdy wszystkie testy są zielone.
+# Wspólny plik w 5 repozytoriach projektu — różnią się tylko CI_WORKFLOWS, BEZ_CI, WSTRZYMAJ_SCIEZKI i PO_SCALENIU.
+# Nie scala: szkiców (draft), PR z etykietą „wstrzymane” albo „decyzja-kamila”, PR z forków, PR z konfliktem,
+# PR zmieniających ścieżki z WSTRZYMAJ_SCIEZKI (np. migracje bazy — te scala wątek po wdrożeniu bazy).
+# Scalenie tokenem GITHUB_TOKEN nie uruchamia workflowów „push” na main, dlatego po scaleniu ten plik sam uruchamia
+# (workflow_dispatch) przebiegi z PO_SCALENIU, z tym samym filtrem ścieżek co ich „push”.
+name: Auto-scalanie
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, unlabeled]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+  checks: read
+  statuses: read
+
+concurrency:
+  group: auto-scalanie
+  cancel-in-progress: false
+
+jobs:
+  scalanie:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          # nazwy workflowów CI (muszą przejść); BEZ_CI: 'tak' = repozytorium bez testów, PR scala się bez nich
+          CI_WORKFLOWS: '[]'
+          BEZ_CI: 'tak'
+          # PR zmieniający te ścieżki czeka na wątek (np. migracje: najpierw baza, potem aplikacja)
+          WSTRZYMAJ_SCIEZKI: '[]'
+          # po scaleniu: [{"plik": "x.yml", "sciezki": ["prefiks/"]}] — puste sciezki = zawsze
+          PO_SCALENIU: '[]'
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const ciNazwy = JSON.parse(process.env.CI_WORKFLOWS);
+            const bezCi = process.env.BEZ_CI === 'tak';
+            const wstrzymaj = JSON.parse(process.env.WSTRZYMAJ_SCIEZKI);
+            const poScaleniu = JSON.parse(process.env.PO_SCALENIU);
+            const ETYKIETY_STOP = ['wstrzymane', 'decyzja-kamila'];
+            const sen = ms => new Promise(r => setTimeout(r, ms));
+
+            // PR do sprawdzenia: z tego zdarzenia albo wszystkie otwarte do main
+            let numery = [];
+            if (context.eventName === 'pull_request') numery = [context.payload.pull_request.number];
+            else if (context.eventName === 'workflow_run') numery = (context.payload.workflow_run.pull_requests || []).map(p => p.number);
+            if (!numery.length) {
+              const otwarte = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', base: 'main', per_page: 100 });
+              numery = otwarte.map(p => p.number);
+            }
+
+            for (const nr of numery) {
+              let pr = (await github.rest.pulls.get({ owner, repo, pull_number: nr })).data;
+              const pomin = powod => core.info(`#${nr}: pomijam — ${powod}`);
+              if (pr.state !== 'open') { pomin('zamknięty'); continue; }
+              if (pr.base.ref !== 'main') { pomin(`cel ${pr.base.ref}, nie main`); continue; }
+              if (pr.draft) { pomin('szkic'); continue; }
+              if (pr.head.repo?.full_name !== `${owner}/${repo}`) { pomin('PR z forka'); continue; }
+              const stop = pr.labels.map(l => l.name).filter(n => ETYKIETY_STOP.includes(n));
+              if (stop.length) { pomin(`etykieta ${stop.join(', ')}`); continue; }
+
+              const pliki = (await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: nr, per_page: 100 })).map(f => f.filename);
+              const zablokowane = pliki.filter(f => wstrzymaj.some(p => f.startsWith(p)));
+              if (zablokowane.length) { pomin(`zmienia ${zablokowane[0]} (scala wątek po wdrożeniu)`); continue; }
+
+              // testy na ostatnim commicie PR
+              const sha = pr.head.sha;
+              const przebiegi = (await github.paginate(github.rest.actions.listWorkflowRunsForRepo, { owner, repo, head_sha: sha, per_page: 100 }))
+                .filter(r => r.event === 'pull_request' && ciNazwy.includes(r.name));
+              // najnowszy przebieg każdego workflowu
+              const ostatnie = new Map();
+              for (const r of przebiegi) if (!ostatnie.has(r.name) || r.run_number > ostatnie.get(r.name).run_number) ostatnie.set(r.name, r);
+              if (!ostatnie.size && !bezCi) { pomin('brak testów na ostatnim commicie (jeszcze się nie zaczęły?)'); continue; }
+              const trwa = [...ostatnie.values()].filter(r => r.status !== 'completed');
+              if (trwa.length) { pomin(`testy trwają: ${trwa.map(r => r.name).join(', ')}`); continue; }
+              const zle = [...ostatnie.values()].filter(r => !['success', 'skipped', 'neutral'].includes(r.conclusion));
+              if (zle.length) { pomin(`testy nie przeszły: ${zle.map(r => `${r.name} (${r.conclusion})`).join(', ')}`); continue; }
+              // statusy spoza Actions (np. podgląd Cloudflare Pages)
+              const st = (await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: sha })).data;
+              if (st.total_count && st.state !== 'success') { pomin(`status ${st.state}`); continue; }
+
+              // GitHub liczy możliwość scalenia w tle
+              for (let i = 0; i < 6 && pr.mergeable === null; i++) { await sen(5000); pr = (await github.rest.pulls.get({ owner, repo, pull_number: nr })).data; }
+              if (pr.mergeable !== true) { pomin(`nie da się scalić (${pr.mergeable_state}) — konflikt rozwiązuje wątek`); continue; }
+
+              try {
+                await github.rest.pulls.merge({ owner, repo, pull_number: nr, sha, merge_method: 'merge' });
+              } catch (e) { core.warning(`#${nr}: scalenie nie wyszło: ${e.message}`); continue; }
+              core.notice(`#${nr} scalony automatycznie (${pr.title})`);
+              await github.rest.issues.createComment({ owner, repo, issue_number: nr,
+                body: 'Scalone automatycznie: wszystkie testy zielone (Auto-scalanie, decyzja Kamila 21.10.2026). Etykieta „wstrzymane” albo „decyzja-kamila” zatrzymuje scalanie.' });
+              for (const p of poScaleniu) {
+                if (p.sciezki.length && !pliki.some(f => p.sciezki.some(s => f.startsWith(s)))) continue;
+                try { await github.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: p.plik, ref: 'main' }); core.info(`uruchomiono ${p.plik} na main`); }
+                catch (e) { core.warning(`${p.plik}: ${e.message}`); }
+              }
+            }
